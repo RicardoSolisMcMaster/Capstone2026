@@ -1,125 +1,68 @@
 #include <Arduino.h>
 
-/*
-  ============================================================
-  2-AXIS GANTRY PROOF OF CONCEPT - ESP32
-  ============================================================
 
-  Sequence:
-  1. Wait for Start press
-  2. Only start if:
-       - cane occupancy = true
-       - stain fullness = true
-  3. Move to Cane 1 X position
-  4. Move Y to top of cane
-  5. Pause and "coat" row-by-row while lowering Y
-  6. Repeat for Cane 2 and Cane 3
-  7. Return to home (X=0, Y=0)
-
-  Controls:
-  - Start button: begin cycle if requirements met
-  - Pause button: pause/resume exactly where it left off
-  - Stop button: abort cycle and return home
-  - Occupancy button: toggle cane occupancy requirement
-  - Stain button: toggle stain fullness requirement
-
-  Notes:
-  - Home/start is assumed to be X=0, Y=0 at power-up
-  - This is open-loop step counting, no physical limit switches
-  - If an axis moves the wrong direction, swap that axis direction constants
-*/
-
-// ============================================================
-// X AXIS MOTOR PINS
-// ============================================================
 const int X_STEP_PIN = 25;
 const int X_DIR_PIN  = 26;
 const int X_ENA_PIN  = 27;
 
-// ============================================================
-// Y AXIS MOTOR PINS
-// ============================================================
 const int Y_STEP_PIN = 14;
 const int Y_DIR_PIN  = 12;
 const int Y_ENA_PIN  = 13;
-
-// ============================================================
-// BUTTON PINS
-// ============================================================
+ 
 const int START_BTN_PIN     = 32;
 const int PAUSE_BTN_PIN     = 33;
 const int STOP_BTN_PIN      = 15;
 const int OCCUPANCY_BTN_PIN = 4;
-const int STAIN_BTN_PIN     = 4;
 
-// ============================================================
-// DRIVER SETTINGS
-// ============================================================
-// Set to false if you do not want to actively control ENA
+const int ACT_RPWM_PIN = 18;
+const int ACT_LPWM_PIN = 19;
+
+const int ACT_PWM_FREQ = 5000;
+const int ACT_PWM_RES  = 8;     // 0-255
+const int ACT_SPEED    = 255;   // full speed
+
+
 const bool USE_ENABLE_PINS = false;
 
-// Common driver logic is often LOW = enabled, HIGH = disabled
 const int DRIVER_ENABLE_LEVEL  = LOW;
 const int DRIVER_DISABLE_LEVEL = HIGH;
 
-// ============================================================
-// DIRECTION SETTINGS
-// Adjust these if either axis moves opposite to intended direction
-// ============================================================
-
-// X axis:
-// LOW  = move right / away from home motor
-// HIGH = move left  / toward home motor
+// x axis:
+// low  = move right / away from home motor
+// high = move left  / toward home motor
 const int X_POSITIVE_DIR = LOW;
 const int X_NEGATIVE_DIR = HIGH;
 
 // Y axis:
-// choose one direction as "up" and the other as "down"
-// You may need to swap these after testing
-const int Y_POSITIVE_DIR = HIGH;   // up
-const int Y_NEGATIVE_DIR = LOW;  // down
-
-// ============================================================
-// MECHANICAL SETTINGS
-// ============================================================
-const long X_MAX_STEPS = 23500;   // full X travel from your testing
-const long Y_MAX_STEPS = 16000;   // adjust to your real Y travel if needed
+// high = up
+// low'  = down
+const int Y_POSITIVE_DIR = HIGH;
+const int Y_NEGATIVE_DIR = LOW;
+ 
+const long X_MAX_STEPS = 23500;
+const long Y_MAX_STEPS = 23500;
 
 const int X_STEPS_PER_MM = 80;
-const int Y_STEPS_PER_MM = 80;    // adjust if Y differs from X
+const int Y_STEPS_PER_MM = 80;
 
-// Cane positions from your working X test
+// Cane positions
 const int POS1_MM = 44;
 const int POS2_MM = 102;
 const int POS3_MM = 102;
 
-// Cane painting settings for Y axis
-const int CANE_HEIGHT_MM = 120;   // adjust to your proof-of-concept cane height
-const int ROW_DROP_MM    = 15;    // how much to lower between coating rows
-const int COAT_DWELL_MS  = 1200;  // how long to "coat" each row
-const int MOVE_SETTLE_MS = 200;   // short settle pause after reaching motion points
+// Cane painting settings
+const int CANE_HEIGHT_MM = 120;
+const int ROW_DROP_MM    = 15;
+const int COAT_DWELL_MS  = 1200;
 
-// ============================================================
-// STEP TIMING
-// Higher interval = slower movement
-// ============================================================
 const unsigned long X_STEP_INTERVAL_US = 700;
 const unsigned long Y_STEP_INTERVAL_US = 700;
 const unsigned long STEP_HIGH_US       = 8;
 
-// ============================================================
-// DEBOUNCE
-// ============================================================
 const unsigned long DEBOUNCE_MS = 40;
 
-// ============================================================
-// SEQUENCE STORAGE
-// ============================================================
 const int MAX_SEQUENCE_POINTS = 80;
-
-// ============================================================
-// SYSTEM STATE
-// ============================================================
+ 
 enum SystemState {
   IDLE,
   RUNNING,
@@ -128,16 +71,9 @@ enum SystemState {
 };
 
 SystemState systemState = IDLE;
-
-// ============================================================
-// REQUIREMENTS
-// ============================================================
+ 
 bool caneOccupancy = false;
-bool stainFull     = false;
 
-// ============================================================
-// AXIS STATE
-// ============================================================
 long currentXSteps = 0;
 long currentYSteps = 0;
 
@@ -150,9 +86,17 @@ bool yStepHigh = false;
 unsigned long lastXStepMicros = 0;
 unsigned long lastYStepMicros = 0;
 
-// ============================================================
-// SEQUENCE POINT
-// ============================================================
+enum ActuatorState {
+  ACT_STOPPED,
+  ACT_EXTENDING,
+  ACT_RETRACTING
+};
+
+ActuatorState actuatorState = ACT_STOPPED;
+
+ 
+// sequence points
+ 
 struct SequencePoint {
   long x;
   long y;
@@ -166,12 +110,9 @@ int sequenceIndex  = 0;
 bool waitingAtPoint = false;
 unsigned long waitStartMs = 0;
 
-// pause timing support
 unsigned long pauseStartedMs = 0;
 
-// ============================================================
-// BUTTON CLASS
-// ============================================================
+
 class DebouncedButton {
 public:
   DebouncedButton(int pin) : _pin(pin) {}
@@ -214,11 +155,8 @@ DebouncedButton startBtn(START_BTN_PIN);
 DebouncedButton pauseBtn(PAUSE_BTN_PIN);
 DebouncedButton stopBtn(STOP_BTN_PIN);
 DebouncedButton occupancyBtn(OCCUPANCY_BTN_PIN);
-DebouncedButton stainBtn(STAIN_BTN_PIN);
 
-// ============================================================
-// HELPERS
-// ============================================================
+
 long xMmToSteps(int mm) {
   return (long)mm * X_STEPS_PER_MM;
 }
@@ -228,14 +166,12 @@ long yMmToSteps(int mm) {
 }
 
 bool requirementsMet() {
-  return caneOccupancy && stainFull;
+  return caneOccupancy;
 }
 
 void printRequirements() {
   Serial.print("Requirements -> Occupancy: ");
-  Serial.print(caneOccupancy ? "READY" : "NOT READY");
-  Serial.print(" | Stain: ");
-  Serial.println(stainFull ? "READY" : "NOT READY");
+  Serial.println(caneOccupancy ? "READY" : "NOT READY");
 }
 
 void enableDrivers() {
@@ -251,6 +187,26 @@ void disableDrivers() {
     digitalWrite(Y_ENA_PIN, DRIVER_DISABLE_LEVEL);
   }
 }
+
+
+void actuatorExtend() {
+  ledcWrite(ACT_RPWM_PIN, ACT_SPEED);
+  ledcWrite(ACT_LPWM_PIN, 0);
+  actuatorState = ACT_EXTENDING;
+}
+
+void actuatorRetract() {
+  ledcWrite(ACT_RPWM_PIN, 0);
+  ledcWrite(ACT_LPWM_PIN, ACT_SPEED);
+  actuatorState = ACT_RETRACTING;
+}
+
+void actuatorStop() {
+  ledcWrite(ACT_RPWM_PIN, 0);
+  ledcWrite(ACT_LPWM_PIN, 0);
+  actuatorState = ACT_STOPPED;
+}
+
 
 void clearSequence() {
   sequenceLength = 0;
@@ -300,18 +256,25 @@ bool allAxesAtTarget() {
   return xAtTarget() && yAtTarget();
 }
 
-// ============================================================
-// BUILD PAINTING SEQUENCE
-// ============================================================
+// Returns true if the next sequence point is still on the same cane
+// Same cane = same x position  and not home
+bool nextPointIsSameCane() {
+  if (sequenceIndex + 1 >= sequenceLength) return false;
+
+  long currentX = sequencePoints[sequenceIndex].x;
+  long nextX    = sequencePoints[sequenceIndex + 1].x;
+
+  if (currentX == 0 && sequencePoints[sequenceIndex].y == 0) return false;
+  return nextX == currentX;
+}
+ 
 void addCanePaintSequence(long caneX) {
   long topY = yMmToSteps(CANE_HEIGHT_MM);
   long rowDropSteps = yMmToSteps(ROW_DROP_MM);
 
-  // Move directly to the TOP of this cane
-  // This makes the platform move diagonally if both X and Y need to change
-  addSequencePoint(caneX, topY, COAT_DWELL_MS);   // row 1 coating at top
+  // Move directly to top of cane with actuator retracted
+  addSequencePoint(caneX, topY, COAT_DWELL_MS);
 
-  // Lower in rows, pausing at each row
   long rowY = topY;
 
   while (rowY > 0) {
@@ -332,7 +295,7 @@ void buildRunSequence() {
   addCanePaintSequence(cane2X);
   addCanePaintSequence(cane3X);
 
-  // Return to start position
+  // return home
   addSequencePoint(0, 0, 0);
 
   sequenceIndex = 0;
@@ -342,13 +305,12 @@ void buildRunSequence() {
   Serial.println(sequenceLength);
 }
 
-// ============================================================
-// CONTROL ACTIONS
-// ============================================================
+ 
 void beginCycle() {
   buildRunSequence();
   systemState = RUNNING;
   enableDrivers();
+  actuatorRetract();
   Serial.println("START pressed -> Cycle started.");
 }
 
@@ -359,7 +321,8 @@ void beginStopReturnHome() {
   waitingAtPoint = false;
   systemState = STOPPING;
   enableDrivers();
-  Serial.println("STOP pressed -> Returning both axes home.");
+  actuatorRetract();
+  Serial.println("STOP pressed -> Retracting actuator and returning home.");
 }
 
 void finishAndGoIdle(const char* msg) {
@@ -375,6 +338,7 @@ void finishAndGoIdle(const char* msg) {
   digitalWrite(X_STEP_PIN, LOW);
   digitalWrite(Y_STEP_PIN, LOW);
 
+  actuatorStop();
   disableDrivers();
 
   Serial.println(msg);
@@ -390,6 +354,7 @@ void togglePause() {
     digitalWrite(X_STEP_PIN, LOW);
     digitalWrite(Y_STEP_PIN, LOW);
 
+    actuatorStop();
     Serial.println("Paused.");
   } else if (systemState == PAUSED) {
     unsigned long pausedDurationMs = millis() - pauseStartedMs;
@@ -399,13 +364,17 @@ void togglePause() {
     lastYStepMicros += pausedDurationMs * 1000UL;
 
     systemState = RUNNING;
+
+    if (waitingAtPoint) {
+      actuatorExtend();
+    } else {
+      actuatorRetract();
+    }
+
     Serial.println("Resumed.");
   }
 }
-
-// ============================================================
-// BUTTON HANDLING
-// ============================================================
+ 
 void handleButtons() {
   if (occupancyBtn.pressed()) {
     caneOccupancy = !caneOccupancy;
@@ -414,19 +383,12 @@ void handleButtons() {
     printRequirements();
   }
 
-  if (stainBtn.pressed()) {
-    stainFull = !stainFull;
-    Serial.print("Stain fullness toggled -> ");
-    Serial.println(stainFull ? "READY" : "NOT READY");
-    printRequirements();
-  }
-
   if (startBtn.pressed()) {
     if (systemState == IDLE) {
       if (requirementsMet()) {
         beginCycle();
       } else {
-        Serial.println("START pressed -> Cannot start. Requirements not met.");
+        Serial.println("START pressed -> Cannot start. Occupancy requirement not met.");
         printRequirements();
       }
     } else {
@@ -457,9 +419,9 @@ void handleButtons() {
   }
 }
 
-// ============================================================
-// MOTION SERVICE - X AXIS
-// ============================================================
+ 
+// motion service x
+ 
 void serviceXMotion() {
   if (!(systemState == RUNNING || systemState == STOPPING)) return;
   if (waitingAtPoint) return;
@@ -488,9 +450,8 @@ void serviceXMotion() {
   }
 }
 
-// ============================================================
-// MOTION SERVICE - Y AXIS
-// ============================================================
+ 
+// motion service y
 void serviceYMotion() {
   if (!(systemState == RUNNING || systemState == STOPPING)) return;
   if (waitingAtPoint) return;
@@ -519,20 +480,21 @@ void serviceYMotion() {
   }
 }
 
-// ============================================================
-// SEQUENCE SERVICE
-// ============================================================
+ 
+// sequence service
 void serviceSequence() {
   if (systemState == IDLE || systemState == PAUSED) return;
 
   if (systemState == STOPPING) {
+    actuatorRetract();
+
     if (currentXSteps == 0 && currentYSteps == 0) {
       finishAndGoIdle("Stop complete -> Home reached.");
     }
     return;
   }
 
-  // RUNNING
+  // running
   if (!waitingAtPoint) {
     if (allAxesAtTarget()) {
       unsigned long dwell = sequencePoints[sequenceIndex].dwellMs;
@@ -540,6 +502,10 @@ void serviceSequence() {
       if (dwell > 0) {
         waitingAtPoint = true;
         waitStartMs = millis();
+
+        if (actuatorState != ACT_EXTENDING) {
+          actuatorExtend();
+        }
 
         Serial.print("Reached point ");
         Serial.print(sequenceIndex + 1);
@@ -566,6 +532,12 @@ void serviceSequence() {
   } else {
     if (millis() - waitStartMs >= sequencePoints[sequenceIndex].dwellMs) {
       waitingAtPoint = false;
+
+      // Only retract if leaving this cane
+      if (!nextPointIsSameCane()) {
+        actuatorRetract();
+      }
+
       sequenceIndex++;
 
       if (sequenceIndex >= sequenceLength) {
@@ -583,9 +555,7 @@ void serviceSequence() {
   }
 }
 
-// ============================================================
-// STATUS PRINTING
-// ============================================================
+
 void printStatusPeriodically() {
   static unsigned long lastPrint = 0;
 
@@ -619,14 +589,16 @@ void printStatusPeriodically() {
     Serial.print(" | Occupancy: ");
     Serial.print(caneOccupancy ? "ON" : "OFF");
 
-    Serial.print(" | Stain: ");
-    Serial.println(stainFull ? "ON" : "OFF");
+    Serial.print(" | Actuator: ");
+    switch (actuatorState) {
+      case ACT_STOPPED:    Serial.println("STOPPED"); break;
+      case ACT_EXTENDING:  Serial.println("EXTENDING"); break;
+      case ACT_RETRACTING: Serial.println("RETRACTING"); break;
+    }
   }
 }
 
-// ============================================================
-// SETUP
-// ============================================================
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -652,28 +624,31 @@ void setup() {
     digitalWrite(Y_ENA_PIN, LOW);
   }
 
+  ledcAttach(ACT_RPWM_PIN, ACT_PWM_FREQ, ACT_PWM_RES);
+  ledcAttach(ACT_LPWM_PIN, ACT_PWM_FREQ, ACT_PWM_RES);
+  actuatorStop();
+
   startBtn.begin();
   pauseBtn.begin();
   stopBtn.begin();
   occupancyBtn.begin();
-  stainBtn.begin();
 
   Serial.println("====================================================");
-  Serial.println("2-Axis Gantry Proof of Concept Ready");
+  Serial.println("2-Axis Gantry + Actuator Proof of Concept Ready");
   Serial.println("Buttons:");
-  Serial.println("START     -> begin cycle if requirements are met");
+  Serial.println("START     -> begin cycle if occupancy is met");
   Serial.println("PAUSE     -> pause / resume");
-  Serial.println("STOP      -> abort and return home");
+  Serial.println("STOP      -> retract actuator, abort, return home");
   Serial.println("OCCUPANCY -> toggle cane occupancy");
-  Serial.println("STAIN     -> toggle stain fullness");
+  Serial.println("Actuator wiring:");
+  Serial.println("RPWM -> GPIO18");
+  Serial.println("LPWM -> GPIO19");
   Serial.println("====================================================");
 
   printRequirements();
 }
 
-// ============================================================
-// LOOP
-// ============================================================
+
 void loop() {
   handleButtons();
   serviceXMotion();
@@ -681,4 +656,3 @@ void loop() {
   serviceSequence();
   printStatusPeriodically();
 }
-

@@ -4,26 +4,33 @@ const int LPWM = 6;
 void setup() {
   pinMode(RPWM, OUTPUT);
   pinMode(LPWM, OUTPUT);
+
+  stopActuator();
+  delay(2000); // small delay before starting
 }
 
 void loop() {
-  // FORWARD
-  analogWrite(RPWM, 255);
-  analogWrite(LPWM, 0);
-  delay(3000);
 
-  // STOP
-  analogWrite(RPWM, 0);
+  // ===== EXTEND FULL SPEED =====
+  analogWrite(RPWM, 255);  // FULL POWER
   analogWrite(LPWM, 0);
+  delay(1000);             // adjust if needed (long enough to fully extend)
+
+  // ===== STOP =====
+  stopActuator();
   delay(1000);
 
-  // REVERSE
+  // ===== RETRACT FULL SPEED =====
   analogWrite(RPWM, 0);
-  analogWrite(LPWM, 255);
-  delay(3000);
+  analogWrite(LPWM, 255);  // FULL POWER
+  delay(1000);             // adjust if needed
 
-  // STOP
+  // ===== STOP =====
+  stopActuator();
+  delay(1000);
+}
+
+void stopActuator() {
   analogWrite(RPWM, 0);
   analogWrite(LPWM, 0);
-  delay(2000);
 }
